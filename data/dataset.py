@@ -19,6 +19,7 @@ are handled at inference time by ``DiCoW.generate`` and should be cut into
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +27,7 @@ from typing import Callable, Sequence
 
 import torch
 from lhotse import CutSet
-from lhotse.dataset import AudioSamples, DynamicBucketingSampler
+from lhotse.dataset import AudioSamples, DynamicBucketingSampler, DynamicCutSampler
 from torch.utils.data import DataLoader
 from transformers import WhisperProcessor
 
@@ -260,12 +261,21 @@ def load_weighted_cutsets(
     *,
     seed: int = 0,
     infinite: bool = True,
+    min_cut_duration: float | None = None,
+    max_cut_duration: float | None = None,
 ) -> CutSet:
     """Lazily mix target-expanded manifests using the requested corpus weights."""
 
     if len(manifest_paths) != len(weights) or not manifest_paths:
         raise ValueError("manifest_paths and weights must have the same non-zero length")
     cutsets = [CutSet.from_jsonl_lazy(path) for path in manifest_paths]
+    if min_cut_duration is not None or max_cut_duration is not None:
+        minimum = 0.0 if min_cut_duration is None else min_cut_duration
+        maximum = math.inf if max_cut_duration is None else max_cut_duration
+        cutsets = [
+            cuts.filter(lambda cut: minimum <= cut.duration <= maximum)
+            for cuts in cutsets
+        ]
     if infinite:
         return CutSet.infinite_mux(*cutsets, weights=list(weights), seed=seed)
     return CutSet.mux(*cutsets, weights=list(weights), seed=seed)
@@ -279,10 +289,12 @@ def make_dataloader(
     num_workers: int = 0,
     shuffle: bool = True,
     seed: int = 0,
+    use_bucketing: bool = True,
 ) -> DataLoader:
     """Construct the standard Lhotse sampler/DataLoader pair for this dataset."""
 
-    sampler = DynamicBucketingSampler(
+    sampler_type = DynamicBucketingSampler if use_bucketing else DynamicCutSampler
+    sampler = sampler_type(
         cuts,
         max_duration=max_duration,
         shuffle=shuffle,

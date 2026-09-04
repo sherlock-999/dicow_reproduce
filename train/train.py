@@ -16,9 +16,8 @@ Example with the six target-expanded training manifests::
         --validation-manifest dev_30s_ts.jsonl.gz \
         --output-dir outputs/dicow
 
-The defaults below are practical starting values, not yet claimed to be the
-paper's exact optimization recipe. Record the final chosen command alongside
-the resulting checkpoint for a reproducible experiment.
+The optimization, validation, and checkpoint defaults match DiCoN v1. Test
+sets are intentionally kept out of training and are evaluated separately.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 from pathlib import Path
 
 import torch
@@ -33,7 +33,7 @@ import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from lhotse import CutSet
-from transformers import WhisperProcessor, get_linear_schedule_with_warmup
+from transformers import WhisperProcessor
 
 from data.dataset import (
     AugmentationConfig,
@@ -42,6 +42,7 @@ from data.dataset import (
     make_dataloader,
 )
 from model.DiCoW import DiCoW
+from txt_norm import get_text_norm
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,24 +60,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", default=None, help="Path to a saved checkpoint directory")
 
-    parser.add_argument("--max-steps", type=int, default=100_000)
-    parser.add_argument("--max-duration", type=float, default=120.0,
+    parser.add_argument("--max-steps", type=int, default=40_000)
+    parser.add_argument("--max-duration", type=float, default=200.0,
                         help="Maximum summed audio seconds in one micro-batch")
+    parser.add_argument("--min-cut-duration", type=float, default=0.4)
+    parser.add_argument("--max-cut-duration", type=float, default=31.0)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-steps", type=int, default=1_000)
-    parser.add_argument("--fddt-only-steps", type=int, default=0,
+    parser.add_argument("--encoder-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--fddt-learning-rate", type=float, default=5e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.001)
+    parser.add_argument("--warmup-steps", type=int, default=2_000)
+    parser.add_argument("--fddt-only-steps", type=int, default=2_000,
                         help="Optional initial steps that update only FDDTs")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="bf16")
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--eval-steps", type=int, default=1_000)
-    parser.add_argument("--max-eval-batches", type=int, default=100)
-    parser.add_argument("--save-steps", type=int, default=1_000)
+    parser.add_argument("--max-eval-batches", type=int, default=60)
+    parser.add_argument("--save-top-k", type=int, default=2)
+    parser.add_argument("--validation-max-duration", type=float, default=200.0)
+    parser.add_argument("--validation-num-workers", type=int, default=4)
     parser.add_argument("--stno-gaussian-probability", type=float, default=0.75)
     parser.add_argument("--stno-gaussian-variance", type=float, default=0.2)
     parser.add_argument("--stno-segment-probability", type=float, default=0.3)
@@ -131,6 +138,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("provide --output-dir or output.output_dir in YAML")
     if args.mixed_precision not in {"no", "fp16", "bf16"}:
         parser.error("mixed_precision must be one of: no, fp16, bf16")
+    if args.save_top_k < 1:
+        parser.error("save_top_k must be at least 1")
     return args
 
 
@@ -140,14 +149,6 @@ def configure_trainable_parameters(model: DiCoW) -> None:
     model.requires_grad_(False)
     model.model.encoder.requires_grad_(True)
     model.model.encoder.embed_positions.requires_grad_(False)
-
-
-def clear_non_fddt_gradients(model: DiCoW) -> None:
-    """Make an optional warm-up update FDDTs without changing the DDP graph."""
-
-    for name, parameter in model.model.encoder.named_parameters():
-        if not name.startswith("fddts."):
-            parameter.grad = None
 
 
 def enter_train_mode(model, accelerator: Accelerator) -> None:
@@ -172,6 +173,76 @@ def trainable_parameter_count(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
 
+def word_errors(reference: str, hypothesis: str) -> tuple[int, int]:
+    """Return Levenshtein word errors and reference word count."""
+
+    ref = reference.split()
+    hyp = hypothesis.split()
+    previous = list(range(len(hyp) + 1))
+    for ref_word in ref:
+        current = [previous[0] + 1]
+        for index, hyp_word in enumerate(hyp, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[index] + 1,
+                    previous[index - 1] + (ref_word != hyp_word),
+                )
+            )
+        previous = current
+    return previous[-1], len(ref)
+
+
+def build_optimizer_and_scheduler(model: DiCoW, args: argparse.Namespace):
+    """Match DiCoN v1's FDDT/encoder groups and delayed cosine schedule."""
+
+    fddt_parameters = list(model.model.encoder.fddts.parameters())
+    fddt_ids = {id(parameter) for parameter in fddt_parameters}
+    encoder_parameters = [
+        parameter
+        for parameter in model.model.encoder.parameters()
+        if parameter.requires_grad and id(parameter) not in fddt_ids
+    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": fddt_parameters,
+                "lr": args.fddt_learning_rate,
+                "weight_decay": args.weight_decay,
+                "name": "fddt",
+            },
+            {
+                "params": encoder_parameters,
+                "lr": args.encoder_learning_rate,
+                "weight_decay": args.weight_decay,
+                "name": "encoder",
+            },
+        ],
+        betas=(0.9, 0.98),
+    )
+
+    def cosine(step: int, start: int) -> float:
+        if step < start:
+            return 0.0
+        if step < start + args.warmup_steps:
+            return (step - start) / max(args.warmup_steps, 1)
+        progress = (step - start - args.warmup_steps) / max(
+            args.max_steps - start - args.warmup_steps, 1
+        )
+        return args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (
+            1 + math.cos(math.pi * min(progress, 1.0))
+        )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        [
+            lambda step: cosine(step, 0),
+            lambda step: cosine(step, args.fddt_only_steps),
+        ],
+    )
+    return optimizer, scheduler
+
+
 def move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
     """Keep metadata out of model.forward and move only tensor fields."""
 
@@ -183,35 +254,70 @@ def move_batch(batch: dict, device: torch.device) -> dict[str, torch.Tensor]:
 
 
 @torch.no_grad()
-def validation_loss(model, loader, accelerator: Accelerator, max_batches: int) -> float:
+def validation_metrics(
+    model,
+    loader,
+    accelerator: Accelerator,
+    processor: WhisperProcessor,
+    max_batches: int,
+) -> dict[str, float]:
+    """Decode the development cuts and aggregate loss and WER over all GPUs."""
+
     model.eval()
-    total_loss = torch.zeros((), device=accelerator.device)
-    total_examples = torch.zeros((), device=accelerator.device)
+    totals = torch.zeros(4, dtype=torch.float64, device=accelerator.device)
+    normalize = get_text_norm("whisper_nsf")
+    unwrapped = accelerator.unwrap_model(model)
     for index, batch in enumerate(loader):
         if index >= max_batches:
             break
-        batch = move_batch(batch, accelerator.device)
-        count = batch["input_features"].shape[0]
-        loss = model(**batch).loss
-        total_loss += loss * count
-        total_examples += count
+        references = batch["texts"]
+        tensors = move_batch(batch, accelerator.device)
+        count = tensors["input_features"].shape[0]
+        loss = model(**tensors).loss
+        token_ids = unwrapped.generate(
+            input_features=tensors["input_features"],
+            attention_mask=tensors["attention_mask"],
+            stno_mask=tensors["stno_mask"],
+            language="en",
+            task="transcribe",
+            use_cache=True,
+        )
+        hypotheses = [normalize(text) for text in processor.batch_decode(
+            token_ids, skip_special_tokens=True
+        )]
+        errors = words = 0
+        for reference, hypothesis in zip(references, hypotheses):
+            utterance_errors, utterance_words = word_errors(reference, hypothesis)
+            errors += utterance_errors
+            words += utterance_words
+        totals += torch.tensor(
+            [loss.item() * count, count, errors, words],
+            dtype=torch.float64,
+            device=accelerator.device,
+        )
 
-    totals = accelerator.reduce(
-        torch.stack((total_loss, total_examples)), reduction="sum"
-    )
+    totals = accelerator.reduce(totals, reduction="sum")
     enter_train_mode(model, accelerator)
-    return float((totals[0] / totals[1].clamp_min(1)).item())
+    return {
+        "loss": float((totals[0] / totals[1].clamp_min(1)).item()),
+        "wer": float((totals[2] / totals[3].clamp_min(1)).item()),
+        "word_errors": int(totals[2].item()),
+        "reference_words": int(totals[3].item()),
+    }
 
 
 def save_checkpoint(
     accelerator: Accelerator,
     model: DiCoW,
     processor: WhisperProcessor,
-    output_dir: Path,
+    checkpoint: Path,
     step: int,
-    best_validation_loss: float,
+    best_validation_wer: float,
+    top_checkpoints: list[dict],
 ) -> Path:
-    checkpoint = output_dir / f"checkpoint-{step}"
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process and checkpoint.exists():
+        shutil.rmtree(checkpoint)
     accelerator.wait_for_everyone()
     unwrapped = accelerator.unwrap_model(model)
     unwrapped.save_pretrained(
@@ -227,14 +333,44 @@ def save_checkpoint(
             json.dumps(
                 {
                     "global_step": step,
-                    "best_validation_loss": best_validation_loss,
+                    "best_validation_wer": (
+                        best_validation_wer
+                        if math.isfinite(best_validation_wer)
+                        else None
+                    ),
+                    "top_checkpoints": top_checkpoints,
                 },
                 indent=2,
             )
             + "\n"
         )
     accelerator.save_state(checkpoint / "accelerator_state")
+    accelerator.wait_for_everyone()
     return checkpoint
+
+
+def ranked_checkpoints(
+    checkpoints: list[dict], candidate: dict, save_top_k: int
+) -> tuple[list[dict], bool]:
+    """Return the lowest-WER checkpoints and whether the candidate belongs."""
+
+    ranked = sorted(
+        [*checkpoints, candidate],
+        key=lambda item: (float(item["val_wer"]), int(item["step"])),
+    )[:save_top_k]
+    return ranked, any(item["path"] == candidate["path"] for item in ranked)
+
+
+def remove_checkpoints(
+    accelerator: Accelerator, output_dir: Path, checkpoint_names: set[str]
+) -> None:
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        for name in checkpoint_names:
+            path = output_dir / name
+            if path.exists():
+                shutil.rmtree(path)
+    accelerator.wait_for_everyone()
 
 
 def main() -> None:
@@ -263,13 +399,18 @@ def main() -> None:
     model.config.use_cache = False
 
     initial_step = 0
-    best_validation_loss = math.inf
+    best_validation_wer = math.inf
+    top_checkpoints: list[dict] = []
     if args.resume:
         state_path = Path(args.resume) / "training_state.json"
         if state_path.exists():
             state = json.loads(state_path.read_text())
             initial_step = int(state["global_step"])
-            best_validation_loss = float(state.get("best_validation_loss", math.inf))
+            stored_best = state.get("best_validation_wer")
+            best_validation_wer = (
+                float(stored_best) if stored_best is not None else math.inf
+            )
+            top_checkpoints = list(state.get("top_checkpoints", []))
 
     fddt_only = initial_step < args.fddt_only_steps
     configure_trainable_parameters(model)
@@ -280,6 +421,8 @@ def main() -> None:
         args.weights,
         seed=args.seed,
         infinite=True,
+        min_cut_duration=args.min_cut_duration,
+        max_cut_duration=args.max_cut_duration,
     )
     train_dataset = DiCoWDataset(
         processor,
@@ -308,30 +451,30 @@ def main() -> None:
 
     validation_loader = None
     if args.validation_manifest:
-        validation_cuts = CutSet.from_jsonl_lazy(args.validation_manifest)
-        validation_dataset = DiCoWDataset(processor, is_train=False)
+        validation_cuts = CutSet.from_jsonl_lazy(args.validation_manifest).filter(
+            lambda cut: args.min_cut_duration <= cut.duration <= args.max_cut_duration
+        )
+        validation_dataset = DiCoWDataset(
+            processor,
+            is_train=False,
+            return_metadata=True,
+        )
         validation_loader = make_dataloader(
             validation_cuts,
             validation_dataset,
-            max_duration=args.max_duration,
-            num_workers=args.num_workers,
+            max_duration=args.validation_max_duration,
+            num_workers=args.validation_num_workers,
             shuffle=False,
             seed=args.seed,
+            use_bucketing=False,
         )
 
-    # Include the whole encoder in the optimizer even during an optional
-    # FDDT-only warm-up. Its gradients are enabled when that stage ends.
-    optimizer_parameters = list(model.model.encoder.parameters())
-    optimizer = torch.optim.AdamW(
-        optimizer_parameters,
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.max_steps,
-    )
+    optimizer_parameters = [
+        parameter
+        for parameter in model.model.encoder.parameters()
+        if parameter.requires_grad
+    ]
+    optimizer, scheduler = build_optimizer_and_scheduler(model, args)
 
     if validation_loader is None:
         model, optimizer, train_loader, scheduler = accelerator.prepare(
@@ -369,10 +512,20 @@ def main() -> None:
             with accelerator.accumulate(model):
                 loss = model(**batch).loss
                 accelerator.backward(loss)
-                if fddt_only:
-                    clear_non_fddt_gradients(accelerator.unwrap_model(model))
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(optimizer_parameters, args.max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_(
+                        optimizer_parameters, args.max_grad_norm
+                    )
+                    finite = torch.isfinite(grad_norm).to(torch.int32)
+                    finite = accelerator.reduce(finite, reduction="min")
+                    if not bool(finite.item()):
+                        for parameter in optimizer_parameters:
+                            if parameter.grad is not None:
+                                parameter.grad.zero_()
+                        accelerator.print(
+                            f"WARNING step={global_step}: non-finite gradients; "
+                            "zeroed this update to protect AdamW state"
+                        )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -386,38 +539,78 @@ def main() -> None:
                 mean_loss = running_loss / (args.log_steps * args.gradient_accumulation_steps)
                 accelerator.print(
                     f"step={global_step} loss={mean_loss:.4f} "
-                    f"lr={scheduler.get_last_lr()[0]:.3e}"
+                    f"fddt_lr={scheduler.get_last_lr()[0]:.3e} "
+                    f"encoder_lr={scheduler.get_last_lr()[1]:.3e}"
                 )
                 running_loss = 0.0
 
             if validation_loader is not None and global_step % args.eval_steps == 0:
-                value = validation_loss(
-                    model, validation_loader, accelerator, args.max_eval_batches
+                metrics = validation_metrics(
+                    model,
+                    validation_loader,
+                    accelerator,
+                    processor,
+                    args.max_eval_batches,
                 )
-                accelerator.print(f"step={global_step} validation_loss={value:.4f}")
-                best_validation_loss = min(best_validation_loss, value)
+                accelerator.print(
+                    f"step={global_step} validation_loss={metrics['loss']:.4f} "
+                    f"val_wer={metrics['wer']:.4f} "
+                    f"({metrics['word_errors']}/{metrics['reference_words']})"
+                )
+                best_validation_wer = min(best_validation_wer, metrics["wer"])
+                checkpoint_name = (
+                    f"checkpoint-step={global_step}-val_wer={metrics['wer']:.4f}"
+                )
+                candidate = {
+                    "path": checkpoint_name,
+                    "step": global_step,
+                    "val_wer": metrics["wer"],
+                }
+                previous_names = {item["path"] for item in top_checkpoints}
+                top_checkpoints, candidate_is_top = ranked_checkpoints(
+                    top_checkpoints, candidate, args.save_top_k
+                )
+                retained_names = {item["path"] for item in top_checkpoints}
 
-            if global_step % args.save_steps == 0:
-                checkpoint = save_checkpoint(
+                if candidate_is_top:
+                    checkpoint = save_checkpoint(
+                        accelerator,
+                        model,
+                        processor,
+                        output_dir / checkpoint_name,
+                        global_step,
+                        best_validation_wer,
+                        top_checkpoints,
+                    )
+                    accelerator.print(f"Saved top-{args.save_top_k} checkpoint {checkpoint}")
+
+                remove_checkpoints(
+                    accelerator,
+                    output_dir,
+                    previous_names - retained_names,
+                )
+                last_checkpoint = save_checkpoint(
                     accelerator,
                     model,
                     processor,
-                    output_dir,
+                    output_dir / "checkpoint-last",
                     global_step,
-                    best_validation_loss,
+                    best_validation_wer,
+                    top_checkpoints,
                 )
-                accelerator.print(f"Saved {checkpoint}")
+                accelerator.print(f"Updated {last_checkpoint}")
 
-    if global_step % args.save_steps != 0:
-        checkpoint = save_checkpoint(
-            accelerator,
-            model,
-            processor,
-            output_dir,
-            global_step,
-            best_validation_loss,
-        )
-        accelerator.print(f"Saved {checkpoint}")
+    # DiCoN keeps `last` even when the final step is not a validation boundary.
+    checkpoint = save_checkpoint(
+        accelerator,
+        model,
+        processor,
+        output_dir / "checkpoint-last",
+        global_step,
+        best_validation_wer,
+        top_checkpoints,
+    )
+    accelerator.print(f"Saved final state to {checkpoint}")
 
 
 if __name__ == "__main__":

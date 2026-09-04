@@ -1,94 +1,101 @@
-# Straightforward DiCoW reproduction
+# DiCoW reproduction
 
-This project reproduces the core DiCoW idea on top of
-`openai/whisper-large-v3-turbo`:
+- Backbone: `openai/whisper-large-v3-turbo`.
+- Goal: reproduce DiCoW with a small, readable Hugging Face codebase.
+- Training protocol: aligned with the DiCoN `train` branch.
 
-- add one diagonal FDDT immediately before every Whisper encoder transformer
-  layer;
-- condition each FDDT with the oracle diarization mask `[S, T, N, O]`;
-- fine-tune the Whisper encoder and FDDTs;
-- keep the Whisper decoder and output projection frozen;
-- use Whisper's timestamp-driven seek loop for recordings longer than 30
-  seconds, while moving the STNO mask with the audio window.
+## Model
 
-`S`, `T`, `N`, and `O` mean silence, target-only speech, non-target-only
-speech, and overlap involving the target speaker.
+| Component | Behavior |
+|---|---|
+| Whisper encoder | Fine-tuned |
+| FDDT | Inserted before every encoder transformer layer and fine-tuned |
+| Whisper decoder | Frozen |
+| Output projection | Frozen |
+| Diarization input | Oracle STNO mask |
 
-## Repository layout
+| STNO channel | Meaning |
+|---|---|
+| `S` | Silence |
+| `T` | Target speaker only |
+| `N` | Non-target speaker only |
+| `O` | Target speaker overlapping another speaker |
 
-```text
-configs/             full and smoke-test training configurations
-data/                target expansion, Lhotse batching, STNO augmentation
-eval/                oracle long-form decoding and meeteval scoring
-model/               FDDT, STNO conversion, and the DiCoW model
-train/train.py       encoder+FDDT training loop
-tests/               data, gradients, and long-form seek tests
-whisper-large-v3-turbo/
-                     local Hugging Face checkpoint and processor
-```
+## Repository
 
-The downloaded Whisper checkpoint, generated manifests, datasets, and training
-outputs are intentionally excluded from Git. The long-form WAV under
-`test_data/` is intentionally versioned because it is the structural seek test
-fixture.
+| Path | Purpose |
+|---|---|
+| `model/DiCoW.py` | Whisper model with FDDT and long-form decoding |
+| `model/FDDT.py` | Diagonal FDDT layer |
+| `model/stno.py` | Oracle diarization to STNO conversion |
+| `data/export_ts_cuts.py` | Expands each cut into one example per target speaker |
+| `data/dataset.py` | Lhotse loading, STNO creation, tokenization, and batching |
+| `train/train.py` | Multi-GPU training, validation, and checkpoints |
+| `eval/run_eval.py` | Full-session oracle decoding and WER scoring |
+| `configs/dicow_v1.yaml` | Main training configuration |
+| `configs/debug.yaml` | Ten-step smoke test |
 
-## 1. Environment setup
+## 1. Setup
 
-The tested environment uses Python 3.10, PyTorch 2.6.0, Transformers 4.57.6,
-and Lhotse 1.32.2. Create it with CUDA 12.4 wheels:
+- Tested with Python 3.10, PyTorch 2.6.0, Transformers 4.57.6, and Lhotse 1.32.2.
+- CUDA 12.4 environment:
 
 ```bash
 ./setup.sh
 conda activate dicow-reproduce
 ```
 
-Choose a different environment name or a CPU-only PyTorch installation with:
+- CPU-only environment for tests:
 
 ```bash
-./setup.sh my-dicow-env cu124
-./setup.sh my-dicow-env cpu
+./setup.sh dicow-reproduce cpu
+conda activate dicow-reproduce
 ```
 
-The CPU environment is suitable for tests, not large-v3-turbo training.
-Dependencies other than PyTorch are pinned in `requirements.txt`.
-
-Verify the installation:
+- Verify the installation:
 
 ```bash
 python -m pytest -q tests
 ```
 
-## 2. Prepare the source manifests
+## 2. Data
 
-Use `mt-asr-data-prep` to download and prepare the corpora. AMI and NOTSOFAR-1
-training sessions are converted into cuts no longer than 30 seconds by
-`pre_segment_using_alignments.py`.
+### Experiment splits
 
-That script does not blindly retain the complete text when a boundary crosses
-an utterance. It uses word timestamps to keep only words fully contained in
-the current audio window, and revisits unfinished/overlapping supervisions in
-the following window. Consequently, a sentence may be divided, but every
-individual audio-text pair remains aligned.
+| Role | Data | Input form |
+|---|---|---|
+| Training | NOTSOFAR-1, AMI, Libri2Mix, Libri3Mix, LibriSpeechMix | Target-expanded cuts of at most 30 seconds |
+| Validation | NOTSOFAR-1 `dev1` | Target-expanded cuts of at most 30 seconds |
+| Test | AMI test or another evaluation set | Full meeting sessions |
 
-LibriMix preparation is different: it retains already-created mixtures shorter
-than 30 seconds. LibriSpeechMix is synthesized from source cuts that fit in the
-30-second limit.
+- Test data is never read by `train/train.py`.
+- Select checkpoints using validation WER only.
+- Run full-session testing separately with `eval/run_eval.py`.
 
-Expected training corpora and sampling weights:
+### Training mixture
 
-| Target-expanded manifest | Corpus | Weight |
-|---|---|---:|
-| `notsofar1_train_30s_ts.jsonl.gz` | NOTSOFAR-1 SDM | 6 |
-| `ami-sdm_train_30s_ts.jsonl.gz` | AMI SDM | 6 |
-| `libri2mix_100_noisy_30s_ts.jsonl.gz` | Libri2Mix train-100 noisy | 1 |
-| `libri2mix_360_noisy_30s_ts.jsonl.gz` | Libri2Mix train-360 noisy | 1 |
-| `libri3mix_360_noisy_30s_ts.jsonl.gz` | Libri3Mix train-360 noisy | 1 |
-| `librispeechmix_train_3mix_ts.jsonl.gz` | LibriSpeechMix, up to 3 speakers | 1 |
+| Manifest | Weight |
+|---|---:|
+| `notsofar1_train_30s_ts.jsonl.gz` | 6 |
+| `ami-sdm_train_30s_ts.jsonl.gz` | 6 |
+| `libri2mix_100_noisy_30s_ts.jsonl.gz` | 1 |
+| `libri2mix_360_noisy_30s_ts.jsonl.gz` | 1 |
+| `libri3mix_360_noisy_30s_ts.jsonl.gz` | 1 |
+| `librispeechmix_train_3mix_ts.jsonl.gz` | 1 |
 
-## 3. Expand each cut by target speaker
+### Creating 30-second cuts
 
-The 30-second source manifests still describe all speakers together. Convert
-each cut into one row per possible target speaker:
+- Use `mt-asr-data-prep` to prepare the corpora.
+- Use alignment-aware segmentation for AMI and NOTSOFAR-1.
+- Word timestamps determine which words belong to each audio window.
+- A sentence may be split, but text outside the window is not added to its target.
+- LibriMix and LibriSpeechMix examples already fit within the 30-second limit.
+
+## 3. Target-speaker expansion
+
+- One source cut may contain several speakers.
+- DiCoW needs a separate training example for every possible target speaker.
+- Create the target-expanded manifests:
 
 ```bash
 mkdir -p manifests
@@ -104,133 +111,159 @@ python -m data.export_ts_cuts \
     --tag ami
 ```
 
-Repeat the same command for the four synthetic manifests, using the output
-names listed in `configs/dicow_v1.yaml`.
+### Concrete example
 
-The exporter adds `_tsidxN` to each cut ID. It does not copy audio. At training
-time, both the exporter and dataset sort speaker IDs identically, so `_tsidx0`
-always identifies the same target.
+| Output cut | Audio | Target | Training text |
+|---|---|---|---|
+| `meeting_001_tsidx0` | Same 30-second meeting window | Speaker A | `let us start` |
+| `meeting_001_tsidx1` | Same 30-second meeting window | Speaker B | `I agree` |
 
-A validation-loss manifest must also contain cuts no longer than 30 seconds
-and be target-expanded. Full-session manifests are used by `eval/run_eval.py`,
-not by the training loss loader.
+- The loader converts these into:
+  - `(audio, STNO for Speaker A) -> "let us start"`.
+  - `(audio, STNO for Speaker B) -> "I agree"`.
+- `_tsidxN` is an index into the cut's sorted speaker list.
+- `_tsidx0` is not a global speaker identity across meetings.
+- The exporter references the same audio; it does not copy it.
+- Target-expand NOTSOFAR-1 `dev1` in the same way and save:
+  - `manifests/notsofar1_dev1_30s_ts.jsonl.gz`.
 
-## 4. Check configuration paths
+## 4. Training configuration
 
-The main configuration is [configs/dicow_v1.yaml](configs/dicow_v1.yaml). Paths are
-interpreted relative to the directory where training is launched, so run from
-this repository root or replace them with absolute paths.
+- Main config: `configs/dicow_v1.yaml`.
+- Paths are relative to the repository root.
 
-Important groups in the YAML:
+| Setting | Value |
+|---|---:|
+| GPUs | 8 |
+| Steps | 40,000 |
+| Batch duration | 200 seconds per GPU |
+| Precision | BF16 |
+| Gradient clipping | 1.0 |
+| AdamW betas | `(0.9, 0.98)` |
+| Weight decay | 0.001 |
+| FDDT learning rate | `5e-4` |
+| Encoder learning rate | `5e-5` |
+| Warm-up | 2,000 steps |
+| Encoder delay | 2,000 steps |
+| Minimum LR ratio | 0.05 |
 
-- `data`: manifests, `6:6:1:1:1:1` weights, MUSAN, and batch duration;
-- `optimization`: steps, learning rate, warm-up, accumulation, and precision;
-- `augmentation`: all reported STNO and MUSAN probabilities;
-- `monitoring`: logging, validation, and checkpoint intervals;
-- `output`: output directory and optional resume checkpoint.
+- Learning-rate behavior:
+  - Steps `0–1999`: FDDT trains; encoder learning rate is zero.
+  - Step `2000` onward: encoder warms up; encoder and FDDT train together.
+  - Both learning rates use cosine decay.
+- Trainable data flow:
 
-The optimizer defaults are explicit starting values. They are not claimed to
-be the paper's exact recipe until the original learning rate, batch size,
-warm-up, and number of updates have been confirmed.
+| Input | Shape | Purpose |
+|---|---|---|
+| `input_features` | `[B, 128, 3000]` | Whisper log-Mel features |
+| `attention_mask` | `[B, 3000]` | Valid audio frames |
+| `stno_mask` | `[B, 4, 1500]` | Oracle or augmented speaker condition |
+| `labels` | `[B, U]` | Target-speaker tokens |
 
-## 5. Smoke test training
+- Training uses teacher forcing and token cross-entropy.
+- Gradients pass through the frozen decoder into the encoder.
+- Only encoder and FDDT parameters are updated.
 
-After producing at least the NOTSOFAR target-expanded manifest, edit its path
-in `configs/debug.yaml` and run:
+### Smoke test
+
+- Update the manifest path in `configs/debug.yaml`.
+- Run:
 
 ```bash
 accelerate launch -m train.train --config configs/debug.yaml
 ```
 
-This runs ten updates with one 30-second micro-batch and no augmentation. It is
-intended to catch path, memory, and forward/backward errors before a full run.
-
-## 6. Full training
+### Eight-GPU training
 
 ```bash
-accelerate launch -m train.train --config configs/dicow_v1.yaml
+accelerate launch --multi_gpu --num_processes 8 \
+    -m train.train --config configs/dicow_v1.yaml
 ```
 
-Explicit command-line options override YAML values. For example:
+- GPU count is controlled by `--num_processes`, not the YAML.
+- Reduce `--max-duration` if the model does not fit in memory.
+- Use gradient accumulation if reducing per-GPU batch duration.
 
-```bash
-accelerate launch -m train.train \
-    --config configs/dicow_v1.yaml \
-    --max-duration 60 \
-    --gradient-accumulation-steps 4 \
-    --mixed-precision fp16
-```
+## 5. Validation and checkpoints
 
-`max_duration` is the sum of audio durations in one GPU micro-batch. With
-30-second cuts, `120` is approximately four full-length examples. Reduce it if
-large-v3-turbo does not fit in GPU memory, then use gradient accumulation to
-recover the desired effective batch size.
+| Setting | Value |
+|---|---|
+| Validation data | NOTSOFAR-1 `dev1` |
+| Frequency | Every 1,000 optimizer steps |
+| Limit | 60 batches |
+| Shuffle | No |
+| Duration bucketing | No |
+| Selection metric | Normalized `val_wer` |
+| Selection direction | Lower is better |
+| Retention | Best 2 plus `checkpoint-last` |
 
-The training batch is:
+- Validation loss is logged for diagnosis.
+- Decoded WER selects checkpoints.
+- Example output:
 
 ```text
-input_features  [B, 128, 3000]   Whisper log-Mel features
-attention_mask  [B, 3000]        valid audio frames
-stno_mask       [B, 4, 1500]     oracle/augmented S-T-N-O mask
-labels          [B, U]           target-speaker Whisper tokens
+checkpoint-step=12000-val_wer=0.1842/
+checkpoint-step=15000-val_wer=0.1798/
+checkpoint-last/
 ```
 
-Training uses teacher forcing and token cross-entropy. The frozen decoder still
-passes gradients back to the encoder; it is simply excluded from optimization.
-Only `model.encoder.*` can be updated. The optional `fddt_only_steps` setting
-can make the first updates affect only FDDTs and defaults to zero.
-
-### Resume
-
-Each checkpoint stores model and processor files plus Accelerate optimizer,
-scheduler, scaler, and random state:
+- A new top-two checkpoint removes the previous worst one.
+- `checkpoint-last` contains the latest model, optimizer, scheduler, scaler, RNG, and step state.
+- Resume with:
 
 ```bash
 accelerate launch -m train.train \
     --config configs/dicow_v1.yaml \
-    --resume outputs/dicow-v1-large-v3-turbo/checkpoint-10000
+    --resume outputs/dicow-v1-large-v3-turbo/checkpoint-last
 ```
 
-You may instead set `output.resume` in the YAML.
+## 6. Full-session evaluation
 
-## 7. Long-form oracle evaluation
-
-Training always uses prepared cuts no longer than 30 seconds. Evaluation may
-use complete meeting recordings.
+- Use the best stable validation-WER checkpoint.
+- Example AMI test command:
 
 ```bash
 python -m eval.run_eval \
-    --cutset /path/to/full_session_dev_cutset.jsonl.gz \
-    --checkpoint outputs/dicow-large-v3-turbo/checkpoint-N \
-    --output outputs/notsofar-dev-scores.json
+    --cutset /path/to/ami-sdm_cutset_test.jsonl.gz \
+    --checkpoint outputs/dicow-v1-large-v3-turbo/checkpoint-step=N-val_wer=W \
+    --output outputs/ami-test-scores.json
 ```
 
-Evaluation performs one decode per oracle target speaker and reports tcpWER,
-cpWER, and real-time factor. For a long recording, Whisper repeatedly encodes
-at most 30 seconds:
+- Oracle evaluation:
+  - Reads the session's reference speaker IDs.
+  - Builds one full-session STNO mask per target speaker.
+  - Decodes the full recording once per target speaker.
+  - Reports tcpWER, cpWER, and real-time factor.
+- Speaker scoring:
+  - Target expansion chooses the speaker during training.
+  - Oracle STNO chooses the speaker during inference.
+  - cpWER finds the best hypothesis-to-reference speaker permutation.
 
-```text
-audio features: [seek : seek + 3000]       100 Hz
-STNO mask:      [seek/2 : seek/2 + 1500]    50 Hz
-```
+### Audio longer than 30 seconds
 
-The seek value comes from Whisper's predicted timestamp segments. DiCoW uses
-the same seek to select the matching part of the full-recording STNO mask. The
-last STNO window is padded with pure silence rather than cropping the recording.
+- Whisper decodes repeated windows of at most 30 seconds.
+- Timestamp tokens determine the next safe `seek` position.
+- DiCoW advances audio and STNO together:
 
-All current reproduction data is English, so generation explicitly uses
-`language="en"` and `task="transcribe"`; no language-detection pass is needed.
+| Signal | Window |
+|---|---|
+| Whisper features at 100 Hz | `[seek : seek + 3000]` |
+| STNO frames at 50 Hz | `[seek / 2 : seek / 2 + 1500]` |
 
-## 8. Tests
+- The final short STNO window is padded with silence.
+- Audio after 30 seconds is not cropped.
+- English is fixed with `language="en"` and `task="transcribe"`.
+
+## 7. Tests
 
 ```bash
 python -m pytest -q tests
 ```
 
-The tests verify:
-
-- real Lhotse audio becomes `[128, 3000]` features and `[4, 1500]` STNO;
-- STNO channels form a probability distribution at every frame;
-- a DiCoW loss can backpropagate into the encoder;
-- decoder parameters remain frozen and receive no gradients;
-- a 354.95-second recording advances audio and STNO with matching seek values.
+- Tests cover:
+  - Lhotse audio and STNO shapes.
+  - STNO probability constraints.
+  - Encoder gradients and frozen decoder parameters.
+  - DiCoN-compatible configuration and learning-rate staging.
+  - Top-two checkpoint ranking.
+  - Matching audio/STNO seek on a 354.95-second recording.

@@ -11,14 +11,20 @@ data:
   validation_manifest: null
   musan_dir: null
   max_duration: 30.0
+  min_cut_duration: 0.4
+  max_cut_duration: 31.0
   num_workers: 0
+  validation_max_duration: 30.0
+  validation_num_workers: 0
 
 optimization:
   max_steps: 10
-  learning_rate: 1.0e-5
+  encoder_learning_rate: 1.0e-5
+  fddt_learning_rate: 1.0e-4
   weight_decay: 0.0
   warmup_steps: 0
   fddt_only_steps: 0
+  min_lr_ratio: 0.05
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   mixed_precision: "no"
@@ -39,7 +45,7 @@ monitoring:
   log_steps: 1
   eval_steps: 10
   max_eval_batches: 1
-  save_steps: 10
+  save_top_k: 2
 
 output:
   output_dir: outputs/debug

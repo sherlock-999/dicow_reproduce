@@ -14,23 +14,29 @@ data:
     - manifests/libri3mix_360_noisy_30s_ts.jsonl.gz
     - manifests/librispeechmix_train_3mix_ts.jsonl.gz
   weights: [6, 6, 1, 1, 1, 1]
-  validation_manifest: manifests/notsofar1_dev_30s_ts.jsonl.gz
+  validation_manifest: manifests/notsofar1_dev1_30s_ts.jsonl.gz
   musan_dir: data/musan/noise
-  max_duration: 120.0
-  num_workers: 4
+  max_duration: 200.0
+  min_cut_duration: 0.4
+  max_cut_duration: 31.0
+  num_workers: 8
+  validation_max_duration: 200.0
+  validation_num_workers: 4
 
 optimization:
-  # These are explicit starting values. Confirm the paper's exact recipe before
-  # treating a run as the final reproduction.
-  max_steps: 100000
-  learning_rate: 1.0e-5
-  weight_decay: 0.01
-  warmup_steps: 1000
-  fddt_only_steps: 0
+  # Same two-stage learning-rate protocol as DiCoN v1: FDDT starts first and
+  # the Whisper encoder begins its own warm-up at step 2000.
+  max_steps: 40000
+  encoder_learning_rate: 5.0e-5
+  fddt_learning_rate: 5.0e-4
+  weight_decay: 0.001
+  warmup_steps: 2000
+  fddt_only_steps: 2000
+  min_lr_ratio: 0.05
   gradient_accumulation_steps: 1
   max_grad_norm: 1.0
   mixed_precision: bf16
-  seed: 0
+  seed: 42
 
 augmentation:
   stno_gaussian_probability: 0.75
@@ -46,8 +52,8 @@ augmentation:
 monitoring:
   log_steps: 10
   eval_steps: 1000
-  max_eval_batches: 100
-  save_steps: 1000
+  max_eval_batches: 60
+  save_top_k: 2
 
 output:
   output_dir: outputs/dicow-v1-large-v3-turbo
