@@ -1,0 +1,61 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Packaging outputs
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Downloaded pretrained models and training checkpoints
+/whisper-large-v3-turbo/
+*.safetensors
+*.ckpt
+*.nemo
+*.pth
+*.pt
+pytorch_model*.bin
+
+# Generated data and target-expanded manifests
+/manifests/
+/datasets/
+/downloads/
+/data/musan/
+*.jsonl.gz
+*.tar.gz
+
+# Experiment outputs and trackers
+/outputs/
+/runs/
+/logs/
+/wandb/
+/lightning_logs/
+/tensorboard/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+test_data/

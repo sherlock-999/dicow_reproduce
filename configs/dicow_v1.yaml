@@ -1,0 +1,54 @@
+# DiCoW v1 reproduction training configuration.
+# Paths are resolved from the directory where the command is launched. Run from
+# the dicow_reproduce repository root.
+
+model:
+  model: whisper-large-v3-turbo
+
+data:
+  train_manifest:
+    - manifests/notsofar1_train_30s_ts.jsonl.gz
+    - manifests/ami-sdm_train_30s_ts.jsonl.gz
+    - manifests/libri2mix_100_noisy_30s_ts.jsonl.gz
+    - manifests/libri2mix_360_noisy_30s_ts.jsonl.gz
+    - manifests/libri3mix_360_noisy_30s_ts.jsonl.gz
+    - manifests/librispeechmix_train_3mix_ts.jsonl.gz
+  weights: [6, 6, 1, 1, 1, 1]
+  validation_manifest: manifests/notsofar1_dev_30s_ts.jsonl.gz
+  musan_dir: data/musan/noise
+  max_duration: 120.0
+  num_workers: 4
+
+optimization:
+  # These are explicit starting values. Confirm the paper's exact recipe before
+  # treating a run as the final reproduction.
+  max_steps: 100000
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 1000
+  fddt_only_steps: 0
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  seed: 0
+
+augmentation:
+  stno_gaussian_probability: 0.75
+  stno_gaussian_variance: 0.2
+  stno_segment_probability: 0.3
+  stno_segment_change_probability: 0.1
+  stno_segment_min_frames: 5
+  stno_segment_max_frames: 20
+  musan_probability: 0.3
+  musan_min_snr_db: 0
+  musan_max_snr_db: 15
+
+monitoring:
+  log_steps: 10
+  eval_steps: 1000
+  max_eval_batches: 100
+  save_steps: 1000
+
+output:
+  output_dir: outputs/dicow-v1-large-v3-turbo
+  resume: null

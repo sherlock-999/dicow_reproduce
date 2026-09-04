@@ -1,0 +1,46 @@
+# Ten-step smoke test using one target-expanded manifest.
+# Change the manifest path to a locally available <=30-second test manifest.
+
+model:
+  model: whisper-large-v3-turbo
+
+data:
+  train_manifest:
+    - manifests/notsofar1_train_30s_ts.jsonl.gz
+  weights: [1]
+  validation_manifest: null
+  musan_dir: null
+  max_duration: 30.0
+  num_workers: 0
+
+optimization:
+  max_steps: 10
+  learning_rate: 1.0e-5
+  weight_decay: 0.0
+  warmup_steps: 0
+  fddt_only_steps: 0
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  mixed_precision: "no"
+  seed: 0
+
+augmentation:
+  stno_gaussian_probability: 0.0
+  stno_gaussian_variance: 0.2
+  stno_segment_probability: 0.0
+  stno_segment_change_probability: 0.1
+  stno_segment_min_frames: 5
+  stno_segment_max_frames: 20
+  musan_probability: 0.0
+  musan_min_snr_db: 0
+  musan_max_snr_db: 15
+
+monitoring:
+  log_steps: 1
+  eval_steps: 10
+  max_eval_batches: 1
+  save_steps: 10
+
+output:
+  output_dir: outputs/debug
+  resume: null
