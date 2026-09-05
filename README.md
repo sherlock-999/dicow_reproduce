@@ -34,6 +34,7 @@
 | `eval/run_eval.py` | Full-session oracle decoding and WER scoring |
 | `configs/dicow_v1.yaml` | Main training configuration |
 | `configs/debug.yaml` | Ten-step smoke test |
+| `DATA_STATUS.md` | Timestamped NSCC dataset and manifest inventory |
 
 ## 1. Setup
 
@@ -43,6 +44,15 @@
 ```bash
 ./setup.sh
 conda activate dicow-reproduce
+```
+
+- `setup.sh` also downloads `openai/whisper-large-v3-turbo` into:
+  - `whisper-large-v3-turbo/`
+- Interrupted checkpoint downloads resume when `setup.sh` is run again.
+- Optional third argument selects another checkpoint directory:
+
+```bash
+./setup.sh dicow-reproduce cu124 /path/to/whisper-large-v3-turbo
 ```
 
 - CPU-only environment for tests:
@@ -124,6 +134,7 @@ python -m data.export_ts_cuts \
 - `_tsidxN` is an index into the cut's sorted speaker list.
 - `_tsidx0` is not a global speaker identity across meetings.
 - The exporter references the same audio; it does not copy it.
+- Speakers with no non-empty transcript are not exported because the training loader rejects empty targets.
 - Target-expand NOTSOFAR-1 `dev1` in the same way and save:
   - `manifests/notsofar1_dev1_30s_ts.jsonl.gz`.
 

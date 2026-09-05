@@ -21,7 +21,7 @@ from lhotse.utils import fastcopy
 
 
 def expanded_cuts(cuts: CutSet):
-    """Yield target-expanded cuts without materializing them in memory."""
+    """Yield non-empty target-speaker cuts without materializing them."""
 
     for cut in cuts:
         speakers = sorted(
@@ -29,7 +29,14 @@ def expanded_cuts(cuts: CutSet):
         )
         if not speakers:
             continue
-        for idx in range(len(speakers)):
+        for idx, speaker in enumerate(speakers):
+            has_transcript = any(
+                (supervision.text or "").strip()
+                for supervision in cut.supervisions
+                if supervision.speaker == speaker
+            )
+            if not has_transcript:
+                continue
             yield fastcopy(cut, id=f"{cut.id}_tsidx{idx}")
 
 

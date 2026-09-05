@@ -3,12 +3,13 @@
 from pathlib import Path
 
 import torch
-from lhotse import CutSet
+from lhotse import CutSet, MonoCut, SupervisionSegment
 from lhotse.utils import fastcopy
 from transformers import WhisperConfig, WhisperProcessor
 
 from data.augment import add_gaussian_noise_and_rescale, soft_segment_augmentation
 from data.dataset import DiCoWDataset, speakers_in_cut
+from data.export_ts_cuts import expanded_cuts
 from model.DiCoW import DiCoW
 from train.train import (
     build_optimizer_and_scheduler,
@@ -40,6 +41,39 @@ def training_cut():
     )
     assert speakers_in_cut(cut)
     return fastcopy(cut, id=f"{cut.id}_tsidx0")
+
+
+def test_target_expansion_skips_speakers_without_transcripts():
+    cut = MonoCut(
+        id="example",
+        start=0.0,
+        duration=2.0,
+        channel=0,
+        supervisions=[
+            SupervisionSegment(
+                id="empty-a",
+                recording_id="recording",
+                start=0.0,
+                duration=0.5,
+                channel=0,
+                speaker="a",
+                text="",
+            ),
+            SupervisionSegment(
+                id="spoken-b",
+                recording_id="recording",
+                start=0.5,
+                duration=1.0,
+                channel=0,
+                speaker="b",
+                text="hello",
+            ),
+        ],
+    )
+
+    expanded = list(expanded_cuts(CutSet.from_cuts([cut])))
+
+    assert [item.id for item in expanded] == ["example_tsidx1"]
 
 
 def tiny_model() -> DiCoW:

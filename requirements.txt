@@ -1,9 +1,11 @@
 # torch and torchaudio are installed by setup.sh from the selected CUDA/CPU index.
 accelerate==1.14.0
+huggingface-hub==0.36.2
 lhotse==1.32.2
 meeteval==0.4.3
 more-itertools==11.1.0
 numpy==1.26.4
+pyloudnorm==0.1.1
 PyYAML==6.0.3
 regex==2026.9.3
 safetensors==0.8.0
