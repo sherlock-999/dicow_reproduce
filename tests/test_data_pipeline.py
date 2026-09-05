@@ -8,7 +8,12 @@ from lhotse.utils import fastcopy
 from transformers import WhisperConfig, WhisperProcessor
 
 from data.augment import add_gaussian_noise_and_rescale, soft_segment_augmentation
-from data.dataset import DiCoWDataset, make_dataloader, speakers_in_cut
+from data.dataset import (
+    DiCoWDataset,
+    TargetTextFilter,
+    make_dataloader,
+    speakers_in_cut,
+)
 from data.export_ts_cuts import expanded_cuts
 from model.DiCoW import DiCoW
 from train.train import (
@@ -94,6 +99,28 @@ def test_target_expansion_skips_speakers_without_transcripts():
     assert [item.id for item in expanded] == ["example_tsidx1"]
 
 
+def test_training_filter_skips_target_text_removed_by_normalization():
+    cut = MonoCut(
+        id="backchannel_tsidx0",
+        start=0.0,
+        duration=1.0,
+        channel=0,
+        supervisions=[
+            SupervisionSegment(
+                id="backchannel",
+                recording_id="recording",
+                start=0.0,
+                duration=1.0,
+                channel=0,
+                speaker="speaker",
+                text="Mm-hmm.",
+            )
+        ],
+    )
+
+    assert not TargetTextFilter()(cut)
+
+
 def tiny_model() -> DiCoW:
     config = WhisperConfig.from_pretrained(MODEL_DIR)
     config.d_model = 32
@@ -175,12 +202,13 @@ def test_dicon_v1_training_protocol_is_encoded_in_yaml():
     assert args.max_steps == 40_000
     assert args.max_duration == 200
     assert args.validation_max_duration == 200
-    assert args.encoder_learning_rate == 5e-5
-    assert args.fddt_learning_rate == 5e-4
+    assert args.encoder_learning_rate == 2e-6
+    assert args.fddt_learning_rate == 2e-6
     assert args.fddt_only_steps == args.warmup_steps == 2_000
     assert args.eval_steps == 1_000
     assert args.max_eval_batches == 60
     assert args.save_top_k == 2
+    assert args.mixed_precision == "no"
 
 
 def test_word_error_and_top_k_checkpoint_selection():

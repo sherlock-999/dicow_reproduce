@@ -50,7 +50,7 @@ PY
 
 python -m train.train \
     --config configs/debug.yaml \
-    --mixed-precision bf16 \
+    --mixed-precision no \
     --output-dir "${OUTPUT_DIR}"
 
 echo "Finished: $(date --iso-8601=seconds)"

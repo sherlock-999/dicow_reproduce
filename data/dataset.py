@@ -113,6 +113,17 @@ def target_text(cut, target_speaker: str, normalize: Callable[[str], str]) -> st
     return " ".join(part for part in parts if part).strip()
 
 
+class TargetTextFilter:
+    """Keep target-expanded cuts with non-empty normalized target text."""
+
+    def __init__(self, text_normalizer: str = "whisper_nsf") -> None:
+        self.normalize = get_text_norm(text_normalizer)
+
+    def __call__(self, cut) -> bool:
+        target = target_speaker_from_cut(cut)
+        return bool(target_text(cut, target, self.normalize))
+
+
 class DiCoWDataset(torch.utils.data.Dataset):
     """Turn a Lhotse CutSet batch into a Hugging Face DiCoW training batch."""
 
@@ -268,7 +279,11 @@ def load_weighted_cutsets(
 
     if len(manifest_paths) != len(weights) or not manifest_paths:
         raise ValueError("manifest_paths and weights must have the same non-zero length")
-    cutsets = [CutSet.from_jsonl_lazy(path) for path in manifest_paths]
+    target_filter = TargetTextFilter()
+    cutsets = [
+        CutSet.from_jsonl_lazy(path).filter(target_filter)
+        for path in manifest_paths
+    ]
     if min_cut_duration is not None or max_cut_duration is not None:
         minimum = 0.0 if min_cut_duration is None else min_cut_duration
         maximum = math.inf if max_cut_duration is None else max_cut_duration
