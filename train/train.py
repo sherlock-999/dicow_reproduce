@@ -447,6 +447,8 @@ def main() -> None:
         num_workers=args.num_workers,
         shuffle=True,
         seed=args.seed,
+        world_size=accelerator.num_processes,
+        rank=accelerator.process_index,
     )
 
     validation_loader = None
@@ -467,6 +469,8 @@ def main() -> None:
             shuffle=False,
             seed=args.seed,
             use_bucketing=False,
+            world_size=accelerator.num_processes,
+            rank=accelerator.process_index,
         )
 
     optimizer_parameters = [
@@ -476,14 +480,10 @@ def main() -> None:
     ]
     optimizer, scheduler = build_optimizer_and_scheduler(model, args)
 
-    if validation_loader is None:
-        model, optimizer, train_loader, scheduler = accelerator.prepare(
-            model, optimizer, train_loader, scheduler
-        )
-    else:
-        model, optimizer, train_loader, validation_loader, scheduler = accelerator.prepare(
-            model, optimizer, train_loader, validation_loader, scheduler
-        )
+    # Lhotse samplers yield complete CutSet batches. Do not pass their loaders
+    # to Accelerator.prepare(): Accelerate replaces the sampler when
+    # batch_size=None. The samplers are distributed explicitly above.
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     if args.resume:
         accelerator.load_state(Path(args.resume) / "accelerator_state")
 

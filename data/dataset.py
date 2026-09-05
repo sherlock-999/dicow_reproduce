@@ -290,8 +290,15 @@ def make_dataloader(
     shuffle: bool = True,
     seed: int = 0,
     use_bucketing: bool = True,
+    world_size: int = 1,
+    rank: int = 0,
 ) -> DataLoader:
-    """Construct the standard Lhotse sampler/DataLoader pair for this dataset."""
+    """Construct a rank-sharded Lhotse sampler/DataLoader pair.
+
+    Keep this loader outside ``Accelerator.prepare``. Accelerate rebuilds
+    loaders with ``batch_size=None`` and replaces their Lhotse sampler with a
+    ``SequentialSampler``, which incorrectly requires ``len(dataset)``.
+    """
 
     sampler_type = DynamicBucketingSampler if use_bucketing else DynamicCutSampler
     sampler = sampler_type(
@@ -299,6 +306,8 @@ def make_dataloader(
         max_duration=max_duration,
         shuffle=shuffle,
         seed=seed,
+        world_size=world_size,
+        rank=rank,
     )
     return DataLoader(
         dataset,

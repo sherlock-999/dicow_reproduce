@@ -8,7 +8,7 @@ from lhotse.utils import fastcopy
 from transformers import WhisperConfig, WhisperProcessor
 
 from data.augment import add_gaussian_noise_and_rescale, soft_segment_augmentation
-from data.dataset import DiCoWDataset, speakers_in_cut
+from data.dataset import DiCoWDataset, make_dataloader, speakers_in_cut
 from data.export_ts_cuts import expanded_cuts
 from model.DiCoW import DiCoW
 from train.train import (
@@ -41,6 +41,24 @@ def training_cut():
     )
     assert speakers_in_cut(cut)
     return fastcopy(cut, id=f"{cut.id}_tsidx0")
+
+
+def test_lhotse_dataloader_supplies_cutset_batches_without_dataset_len():
+    class CutBatchIds(torch.utils.data.Dataset):
+        def __getitem__(self, cuts):
+            return [cut.id for cut in cuts]
+
+    cut = MonoCut(id="sampler-cut", start=0.0, duration=1.0, channel=0)
+    loader = make_dataloader(
+        CutSet.from_cuts([cut]),
+        CutBatchIds(),
+        max_duration=2.0,
+        num_workers=0,
+        shuffle=False,
+        use_bucketing=False,
+    )
+
+    assert next(iter(loader)) == ["sampler-cut"]
 
 
 def test_target_expansion_skips_speakers_without_transcripts():
