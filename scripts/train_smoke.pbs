@@ -2,7 +2,8 @@
 #PBS -N dicow_smoke
 #PBS -P Personal
 #PBS -q normal
-#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+# NSCC allocates at least 16 CPU cores and 110 GB RAM with one A100.
+#PBS -l select=1:ncpus=16:ngpus=1:mem=110gb
 #PBS -l walltime=01:00:00
 #PBS -j oe
 #PBS -o /scratch/users/ntu/d230009/project/DiCoW_exp/dicow_reproduce/logs/pbs/dicow_smoke.scheduler.log
