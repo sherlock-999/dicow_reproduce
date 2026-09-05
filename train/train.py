@@ -53,6 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="YAML configuration. Explicit command-line arguments override it.",
     )
     parser.add_argument("--model", default="whisper-large-v3-turbo")
+    parser.add_argument(
+        "--fddt-initialization",
+        choices=["identity", "suppressive"],
+        default="suppressive",
+        help="FDDT initialization when starting from an ordinary Whisper checkpoint.",
+    )
+    parser.add_argument("--fddt-suppressive-scale", type=float, default=0.1)
     parser.add_argument("--train-manifest", nargs="+", default=None)
     parser.add_argument("--weights", nargs="+", type=float, default=[6, 6, 1, 1, 1, 1])
     parser.add_argument("--validation-manifest", default=None)
@@ -379,6 +386,8 @@ def main() -> None:
         raise ValueError("--train-manifest and --weights must have the same length")
     if args.fddt_only_steps < 0 or args.fddt_only_steps > args.max_steps:
         raise ValueError("--fddt-only-steps must lie between 0 and --max-steps")
+    if not 0.0 <= args.fddt_suppressive_scale <= 1.0:
+        raise ValueError("--fddt-suppressive-scale must lie between 0 and 1")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -395,7 +404,16 @@ def main() -> None:
 
     load_path = args.resume or args.model
     processor = WhisperProcessor.from_pretrained(load_path, local_files_only=True)
-    model = DiCoW.from_pretrained(load_path, local_files_only=True)
+    model_kwargs = {"local_files_only": True}
+    if not args.resume:
+        model_config = DiCoW.config_class.from_pretrained(
+            load_path,
+            local_files_only=True,
+        )
+        model_config.fddt_initialization = args.fddt_initialization
+        model_config.fddt_suppressive_scale = args.fddt_suppressive_scale
+        model_kwargs["config"] = model_config
+    model = DiCoW.from_pretrained(load_path, **model_kwargs)
     model.config.use_cache = False
 
     initial_step = 0

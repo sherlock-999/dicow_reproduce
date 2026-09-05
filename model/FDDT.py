@@ -20,24 +20,59 @@ class DiagonalAffine(nn.Module):
 
     def __init__(self, size: int, initial_scale: float = 1.0) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.full((size,), float(initial_scale)))
-        self.bias = nn.Parameter(torch.zeros(size))
+        self.initial_scale = float(initial_scale)
+        self.weight = nn.Parameter(torch.empty(size))
+        self.bias = nn.Parameter(torch.empty(size))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Restore the intended affine initialization.
+
+        Hugging Face creates checkpoint-missing parameters on a meta device
+        before materializing them. A dedicated reset method ensures newly
+        added FDDT parameters are initialized rather than left as empty
+        memory when loading an ordinary Whisper checkpoint.
+        """
+
+        with torch.no_grad():
+            self.weight.fill_(self.initial_scale)
+            self.bias.zero_()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states * self.weight + self.bias
 
 
 class FDDT(nn.Module):
-    """Mix four diagonal affine transforms according to an STNO mask."""
+    """Mix four diagonal affine transforms according to an STNO mask.
 
-    def __init__(self, d_model: int, non_target_scale: float = 1.0) -> None:
+    ``identity`` starts all four transforms as identity mappings.
+    ``suppressive`` starts silence and non-target transforms at a small
+    diagonal scale while target speech and overlap remain identity mappings.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        initialization: str = "suppressive",
+        suppressive_scale: float = 0.1,
+    ) -> None:
         super().__init__()
 
-        # Target speech and overlap initially pass through unchanged.  Silence
-        # and non-target speech may optionally be attenuated at initialization.
-        self.silence = DiagonalAffine(d_model, non_target_scale)
+        if initialization not in {"identity", "suppressive"}:
+            raise ValueError(
+                "initialization must be 'identity' or 'suppressive', got "
+                f"{initialization!r}"
+            )
+        if not 0.0 <= suppressive_scale <= 1.0:
+            raise ValueError("suppressive_scale must lie in [0, 1]")
+
+        suppress = 1.0 if initialization == "identity" else suppressive_scale
+        self.initialization = initialization
+        self.suppressive_scale = float(suppressive_scale)
+        self.silence = DiagonalAffine(d_model, suppress)
         self.target = DiagonalAffine(d_model, 1.0)
-        self.non_target = DiagonalAffine(d_model, non_target_scale)
+        self.non_target = DiagonalAffine(d_model, suppress)
         self.overlap = DiagonalAffine(d_model, 1.0)
 
     def forward(
@@ -76,4 +111,3 @@ class FDDT(nn.Module):
             + self.non_target(hidden_states) * mask[:, 2]
             + self.overlap(hidden_states) * mask[:, 3]
         )
-

@@ -14,10 +14,10 @@ from transformers import WhisperForConditionalGeneration
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
 
 try:
-    from .FDDT import FDDT
+    from .FDDT import DiagonalAffine, FDDT
     from .stno import slice_stno_mask
 except ImportError:  # Allows running this file directly during development.
-    from FDDT import FDDT
+    from FDDT import DiagonalAffine, FDDT
     from stno import slice_stno_mask
 
 
@@ -27,16 +27,16 @@ class DiCoWEncoder(WhisperEncoder):
     def __init__(self, config) -> None:
         super().__init__(config)
 
-        # The first FDDT starts by attenuating silence and non-target speech.
-        # Every later FDDT starts as the identity and learns from training.
-        initial_scale = getattr(config, "fddt_initial_non_target_scale", 0.5)
+        initialization = getattr(config, "fddt_initialization", "suppressive")
+        suppressive_scale = getattr(config, "fddt_suppressive_scale", 0.1)
         self.fddts = torch.nn.ModuleList(
             [
                 FDDT(
                     config.d_model,
-                    non_target_scale=initial_scale if index == 0 else 1.0,
+                    initialization=initialization,
+                    suppressive_scale=suppressive_scale,
                 )
-                for index in range(len(self.layers))
+                for _ in self.layers
             ]
         )
 
@@ -103,13 +103,51 @@ class DiCoWForConditionalGeneration(WhisperForConditionalGeneration):
     """Whisper with a diarization-conditioned encoder and frozen decoder."""
 
     def __init__(self, config) -> None:
-        if not hasattr(config, "fddt_initial_non_target_scale"):
-            config.fddt_initial_non_target_scale = 0.5
+        if not hasattr(config, "fddt_initialization"):
+            config.fddt_initialization = "suppressive"
+        if not hasattr(config, "fddt_suppressive_scale"):
+            config.fddt_suppressive_scale = 0.1
 
         super().__init__(config)
         self.model.encoder = DiCoWEncoder(config)
         self.config.architectures = [self.__class__.__name__]
         self.freeze_for_encoder_finetuning()
+
+    def _init_weights(self, module) -> None:
+        """Initialize FDDTs that are absent from a Whisper checkpoint."""
+
+        if isinstance(module, DiagonalAffine):
+            module.reset_parameters()
+            return
+        super()._init_weights(module)
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """Load Whisper weights and explicitly initialize missing FDDTs.
+
+        Transformers may materialize checkpoint-missing parameters after
+        normal module initialization. Requesting loading information lets us
+        reset exactly those FDDT branches while preserving trained FDDTs in a
+        DiCoW checkpoint.
+        """
+
+        return_loading_info = kwargs.pop("output_loading_info", False)
+        kwargs["output_loading_info"] = True
+        model, loading_info = super().from_pretrained(*args, **kwargs)
+        missing_keys = set(loading_info.get("missing_keys", ()))
+
+        for name, module in model.named_modules():
+            if not isinstance(module, DiagonalAffine):
+                continue
+            if any(
+                f"{name}.{parameter}" in missing_keys
+                for parameter in ("weight", "bias")
+            ):
+                module.reset_parameters()
+
+        if return_loading_info:
+            return model, loading_info
+        return model
 
     def freeze_for_encoder_finetuning(self) -> None:
         """Train the Whisper encoder and FDDTs; freeze decoder and LM head."""

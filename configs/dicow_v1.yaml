@@ -4,6 +4,8 @@
 
 model:
   model: whisper-large-v3-turbo
+  fddt_initialization: suppressive
+  fddt_suppressive_scale: 0.1
 
 data:
   train_manifest:

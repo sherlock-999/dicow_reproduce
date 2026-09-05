@@ -5,7 +5,11 @@ from pathlib import Path
 import torch
 from lhotse import CutSet, MonoCut, SupervisionSegment
 from lhotse.utils import fastcopy
-from transformers import WhisperConfig, WhisperProcessor
+from transformers import (
+    WhisperConfig,
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+)
 
 from data.augment import add_gaussian_noise_and_rescale, soft_segment_augmentation
 from data.dataset import (
@@ -16,6 +20,7 @@ from data.dataset import (
 )
 from data.export_ts_cuts import expanded_cuts
 from model.DiCoW import DiCoW
+from model.FDDT import DiagonalAffine, FDDT
 from train.train import (
     build_optimizer_and_scheduler,
     configure_trainable_parameters,
@@ -133,6 +138,62 @@ def tiny_model() -> DiCoW:
     return DiCoW(config)
 
 
+def test_hugging_face_initializes_checkpoint_missing_fddt_parameters():
+    model = tiny_model()
+    affine = DiagonalAffine(8, initial_scale=0.1)
+    with torch.no_grad():
+        affine.weight.fill_(torch.nan)
+        affine.bias.fill_(torch.nan)
+
+    model._init_weights(affine)
+
+    torch.testing.assert_close(affine.weight, torch.full((8,), 0.1))
+    torch.testing.assert_close(affine.bias, torch.zeros(8))
+
+
+def test_loading_whisper_checkpoint_initializes_missing_fddts(tmp_path):
+    config = tiny_model().config
+    WhisperForConditionalGeneration(config).save_pretrained(tmp_path)
+
+    model = DiCoW.from_pretrained(tmp_path, local_files_only=True)
+
+    for index, fddt in enumerate(model.model.encoder.fddts):
+        expected = {
+            "silence": 0.1,
+            "target": 1.0,
+            "non_target": 0.1,
+            "overlap": 1.0,
+        }
+        for branch_name, initial_scale in expected.items():
+            branch = getattr(fddt, branch_name)
+            torch.testing.assert_close(
+                branch.weight,
+                torch.full_like(branch.weight, initial_scale),
+            )
+            torch.testing.assert_close(branch.bias, torch.zeros_like(branch.bias))
+
+
+def test_fddt_identity_and_suppressive_initialization_modes():
+    identity = FDDT(8, initialization="identity")
+    suppressive = FDDT(8, initialization="suppressive", suppressive_scale=0.1)
+
+    for branch_name in ("silence", "target", "non_target", "overlap"):
+        torch.testing.assert_close(
+            getattr(identity, branch_name).weight,
+            torch.ones(8),
+        )
+
+    for branch_name, expected in {
+        "silence": 0.1,
+        "target": 1.0,
+        "non_target": 0.1,
+        "overlap": 1.0,
+    }.items():
+        branch = getattr(suppressive, branch_name)
+        torch.testing.assert_close(branch.weight, torch.full((8,), expected))
+        torch.testing.assert_close(branch.bias, torch.zeros(8))
+
+
 def test_lhotse_batch_matches_dicow_forward():
     processor = WhisperProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
     dataset = DiCoWDataset(processor, is_train=False, return_metadata=True)
@@ -205,6 +266,8 @@ def test_dicon_v1_training_protocol_is_encoded_in_yaml():
     assert args.encoder_learning_rate == 2e-6
     assert args.fddt_learning_rate == 2e-6
     assert args.fddt_only_steps == args.warmup_steps == 2_000
+    assert args.fddt_initialization == "suppressive"
+    assert args.fddt_suppressive_scale == 0.1
     assert args.eval_steps == 1_000
     assert args.max_eval_batches == 60
     assert args.save_top_k == 2
