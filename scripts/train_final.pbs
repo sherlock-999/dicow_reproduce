@@ -2,9 +2,9 @@
 #PBS -N dicow_v1_train
 #PBS -P Personal
 #PBS -q normal
-# Two A100s keep the job schedulable; NSCC bundles 16 CPUs and 110 GB per GPU.
+# Eight A100s; request NSCC's 16 CPUs and 110 GB RAM per GPU.
 # Use checkpoints to continue training across 24-hour jobs.
-#PBS -l select=1:ncpus=32:ngpus=2:mem=220gb
+#PBS -l select=1:ncpus=128:ngpus=8:mem=880gb
 #PBS -l walltime=24:00:00
 #PBS -j oe
 #PBS -o /scratch/users/ntu/d230009/project/DiCoW_exp/dicow_reproduce/logs/pbs/dicow_v1_train.scheduler.log
@@ -61,8 +61,8 @@ python - <<'PY'
 import torch
 
 assert torch.cuda.is_available(), "CUDA is unavailable"
-assert torch.cuda.device_count() == 2, torch.cuda.device_count()
-print("CUDA preflight:", [torch.cuda.get_device_name(i) for i in range(2)])
+assert torch.cuda.device_count() == 8, torch.cuda.device_count()
+print("CUDA preflight:", [torch.cuda.get_device_name(i) for i in range(8)])
 PY
 
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
@@ -80,7 +80,7 @@ fi
 
 "${ENV_DIR}/bin/accelerate" launch \
     --multi_gpu \
-    --num_processes 2 \
+    --num_processes 8 \
     --num_machines 1 \
     -m train.train "${train_args[@]}"
 
