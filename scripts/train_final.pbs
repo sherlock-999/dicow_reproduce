@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #PBS -N dicow_v1_train
 #PBS -P Personal
-#PBS -q normal
-# Eight A100s; request NSCC's 16 CPUs and 110 GB RAM per GPU.
+#PBS -q ai
+# One eight-GPU A100 AI node; PBS applies the CPU/RAM ratio automatically.
 # Use checkpoints to continue training across 24-hour jobs.
-#PBS -l select=1:ncpus=128:ngpus=8:mem=880gb
+#PBS -l select=1:ngpus=8
 #PBS -l walltime=24:00:00
 #PBS -j oe
 #PBS -o /scratch/users/ntu/d230009/project/DiCoW_exp/dicow_reproduce/logs/pbs/dicow_v1_train.scheduler.log
